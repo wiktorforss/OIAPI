@@ -3,8 +3,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
 from typing import Optional, List
 from datetime import date, datetime, timedelta
-import requests
-from bs4 import BeautifulSoup
+import subprocess
+import csv
+import os
+import yaml
 
 from ..database import get_db
 from ..models import InsiderTrade
@@ -12,9 +14,10 @@ from ..schemas import InsiderTradeResponse, TickerSummary
 
 router = APIRouter(prefix="/insider", tags=["Insider Trades"])
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
-}
+SCRAPER_DIR = os.getenv("SCRAPER_DIR", "/root/openinsiderData")
+SCRAPER_CONFIG = os.path.join(SCRAPER_DIR, "config.yaml")
+SCRAPER_CSV = os.path.join(SCRAPER_DIR, "data", "insider_trades.csv")
+SCRAPER_VENV_PYTHON = os.path.join(SCRAPER_DIR, "venv", "bin", "python3")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,7 +52,7 @@ def _clean_value(val: str) -> float | None:
 def _parse_date(val: str) -> date | None:
     if not val:
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
         try:
             return datetime.strptime(val.strip(), fmt).date()
         except ValueError:
@@ -57,74 +60,108 @@ def _parse_date(val: str) -> date | None:
     return None
 
 
-def _scrape_ticker(ticker: str, years: int = 5) -> list[dict]:
-    """Scrape openinsider.com for a ticker going back `years` years."""
-    ticker = ticker.upper()
-    date_from = (datetime.now() - timedelta(days=365 * years)).strftime("%m/%d/%Y")
-    date_to   = datetime.now().strftime("%m/%d/%Y")
+def _run_scraper_for_ticker(ticker: str, years: int = 5):
+    """
+    Temporarily updates config.yaml to scrape only the requested ticker
+    going back `years` years, runs the scraper, then restores the config.
+    """
+    # Read current config
+    with open(SCRAPER_CONFIG, "r") as f:
+        config = yaml.safe_load(f)
 
-    url = (
-        f"https://openinsider.com/screener"
-        f"?s={ticker}"
-        f"&fd=-1&fdr={date_from}+-+{date_to}"
-        f"&cnt=500&action=6"
-    )
+    # Save original values to restore later
+    original_include  = config["filters"].get("include_companies", [])
+    original_year     = config["scraping"]["start_year"]
+    original_month    = config["scraping"]["start_month"]
 
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"openinsider.com returned {resp.status_code}")
+    # Calculate start year/month
+    start_date = datetime.now() - timedelta(days=365 * years)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.find("table", {"class": "tinytable"})
-    if not table:
-        return []
+    # Patch config
+    config["filters"]["include_companies"] = [ticker]
+    config["scraping"]["start_year"]  = start_date.year
+    config["scraping"]["start_month"] = start_date.month
 
-    headers = [th.get_text(strip=True) for th in table.find_all("th")]
-    rows = []
-    for tr in table.find("tbody").find_all("tr"):
-        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if cells:
-            rows.append(dict(zip(headers, cells)))
+    try:
+        with open(SCRAPER_CONFIG, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
 
-    return rows
+        # Run the scraper
+        result = subprocess.run(
+            [SCRAPER_VENV_PYTHON, "openinsider_scraper.py"],
+            cwd=SCRAPER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
 
+        if result.returncode != 0:
+            raise RuntimeError(f"Scraper failed: {result.stderr}")
 
-def _rows_to_trades(rows: list[dict], ticker: str) -> list[dict]:
-    """Map scraped table rows to insider_trades column dicts."""
-    trades = []
-    for row in rows:
-        trades.append({
-            "filing_date":      _parse_date(row.get("Filing Date") or row.get("FilingDate") or ""),
-            "trade_date":       _parse_date(row.get("Trade Date") or row.get("TradeDate") or ""),
-            "ticker":           ticker,
-            "company_name":     row.get("Issuer", "").strip(),
-            "insider_name":     row.get("Insider Name", row.get("InsiderName", "")).strip(),
-            "insider_title":    row.get("Title", "").strip(),
-            "transaction_type": row.get("Trade Type", row.get("TradeType", "")).strip(),
-            "price":            _clean_price(row.get("Price", "")),
-            "qty":              _clean_qty(row.get("Qty", "")),
-            "owned":            _clean_qty(row.get("Owned", "")),
-            "delta_own":        row.get("\u0394Own", row.get("DeltaOwn", "")).strip(),
-            "value":            _clean_value(row.get("Value", "")),
-        })
-    return [t for t in trades if t["trade_date"] is not None]
+    finally:
+        # Always restore original config even if scraper fails
+        config["filters"]["include_companies"] = original_include
+        config["scraping"]["start_year"]  = original_year
+        config["scraping"]["start_month"] = original_month
+        with open(SCRAPER_CONFIG, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
 
 
-def _upsert_trades(trades: list[dict], db: Session) -> int:
-    """Insert trades, skipping duplicates. Returns count of new rows."""
+def _load_csv_for_ticker(ticker: str, db: Session) -> tuple[int, int]:
+    """
+    Reads the scraper CSV and upserts rows matching the ticker.
+    Returns (inserted, skipped).
+    """
+    if not os.path.exists(SCRAPER_CSV):
+        raise FileNotFoundError(f"CSV not found at {SCRAPER_CSV}")
+
     inserted = 0
-    for t in trades:
-        exists = db.query(InsiderTrade).filter(
-            InsiderTrade.ticker           == t["ticker"],
-            InsiderTrade.trade_date       == t["trade_date"],
-            InsiderTrade.insider_name     == t["insider_name"],
-            InsiderTrade.transaction_type == t["transaction_type"],
-        ).first()
-        if not exists:
-            db.add(InsiderTrade(**t))
+    skipped  = 0
+
+    with open(SCRAPER_CSV, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row_ticker = row.get("ticker", "").strip().upper()
+            if row_ticker != ticker:
+                continue
+
+            trade_date    = _parse_date(row.get("trade_date", ""))
+            insider_name  = row.get("owner_name", "").strip()
+            tx_type       = row.get("transaction_type", "").strip()
+
+            if not trade_date:
+                continue
+
+            # Check for duplicate
+            exists = db.query(InsiderTrade).filter(
+                InsiderTrade.ticker           == ticker,
+                InsiderTrade.trade_date       == trade_date,
+                InsiderTrade.insider_name     == insider_name,
+                InsiderTrade.transaction_type == tx_type,
+            ).first()
+
+            if exists:
+                skipped += 1
+                continue
+
+            db.add(InsiderTrade(
+                filing_date      = _parse_date(row.get("transaction_date", "")),
+                trade_date       = trade_date,
+                ticker           = ticker,
+                company_name     = row.get("company_name", "").strip(),
+                insider_name     = insider_name,
+                insider_title    = row.get("Title", "").strip(),
+                transaction_type = tx_type,
+                price            = _clean_price(row.get("last_price", "")),
+                qty              = _clean_qty(row.get("Qty", "")),
+                owned            = _clean_qty(row.get("shares_held", "")),
+                delta_own        = row.get("Owned", "").strip(),
+                value            = _clean_value(row.get("Value", "")),
+            ))
             inserted += 1
+
     db.commit()
-    return inserted
+    return inserted, skipped
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -190,38 +227,39 @@ def get_tracked_tickers(db: Session = Depends(get_db)):
 @router.post("/fetch/{ticker}")
 def fetch_ticker(
     ticker: str,
-    years: int = Query(5, ge=1, le=20),
+    years: int = Query(5, ge=1, le=10),
     db: Session = Depends(get_db)
 ):
     """
-    Scrape openinsider.com for a specific ticker and load into the database.
-    Skips duplicates automatically.
+    Runs the openinsiderData scraper filtered to a single ticker,
+    then loads the results into the database. Skips duplicates.
     """
-    ticker = ticker.upper()
+    ticker = ticker.upper().strip()
+
+    if not os.path.exists(SCRAPER_CONFIG):
+        raise HTTPException(status_code=500, detail=f"Scraper config not found at {SCRAPER_CONFIG}")
+
     try:
-        rows = _scrape_ticker(ticker, years)
-    except HTTPException:
-        raise
+        _run_scraper_for_ticker(ticker, years)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Scraper timed out after 5 minutes")
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to scrape openinsider.com: {e}")
+        raise HTTPException(status_code=500, detail=f"Scraper error: {e}")
 
-    if not rows:
-        return {
-            "ticker": ticker,
-            "scraped": 0,
-            "inserted": 0,
-            "message": f"No insider trades found for {ticker} on openinsider.com"
-        }
-
-    trades = _rows_to_trades(rows, ticker)
-    inserted = _upsert_trades(trades, db)
+    try:
+        inserted, skipped = _load_csv_for_ticker(ticker, db)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load CSV: {e}")
 
     return {
-        "ticker": ticker,
-        "scraped": len(trades),
+        "ticker":   ticker,
         "inserted": inserted,
-        "skipped": len(trades) - inserted,
-        "message": f"Fetched {ticker}: {inserted} new trades added, {len(trades) - inserted} duplicates skipped."
+        "skipped":  skipped,
+        "message":  f"Fetched {ticker}: {inserted} new trades added, {skipped} duplicates skipped."
     }
 
 
@@ -233,11 +271,10 @@ def get_ticker_summary(ticker: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"No insider trades found for {ticker}")
 
     purchases = [t for t in trades if "Purchase" in (t.transaction_type or "")]
-    sales = [t for t in trades if "Sale" in (t.transaction_type or "")]
+    sales     = [t for t in trades if "Sale"     in (t.transaction_type or "")]
 
     from ..models import MyTrade
-    my_trades = db.query(MyTrade).filter(MyTrade.ticker == ticker).all()
-
+    my_trades  = db.query(MyTrade).filter(MyTrade.ticker == ticker).all()
     returns_1m = [mt.performance.return_1m for mt in my_trades if mt.performance and mt.performance.return_1m is not None]
     returns_3m = [mt.performance.return_3m for mt in my_trades if mt.performance and mt.performance.return_3m is not None]
 
