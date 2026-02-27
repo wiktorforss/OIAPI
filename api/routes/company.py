@@ -12,17 +12,20 @@ from ..models import User
 
 router = APIRouter(prefix="/company", tags=["Company"])
 
-POLYGON_KEY       = os.getenv("POLYGON_KEY", "")
+POLYGON_KEY         = os.getenv("POLYGON_KEY", "")
 CACHE_MAX_AGE_HOURS = 24
+
+
+def is_purchase(tx_type: str | None) -> bool:
+    return (tx_type or "").upper() in ("P", "P - PURCHASE", "PURCHASE")
+
+def is_sale(tx_type: str | None) -> bool:
+    return (tx_type or "").upper() in ("S", "S - SALE", "SALE")
 
 
 # ── Polygon fetcher ───────────────────────────────────────────────────────────
 
 async def fetch_polygon_prices(ticker: str) -> list[dict]:
-    """
-    Fetch up to 5 years of daily OHLCV from Polygon.io.
-    Free tier: 5 req/min, unlimited daily calls.
-    """
     if not POLYGON_KEY:
         raise HTTPException(status_code=500, detail="POLYGON_KEY not set in .env")
 
@@ -43,7 +46,7 @@ async def fetch_polygon_prices(ticker: str) -> list[dict]:
             if resp.status_code == 403:
                 raise HTTPException(status_code=403, detail="Invalid Polygon API key")
             if resp.status_code == 429:
-                raise HTTPException(status_code=429, detail="Polygon rate limit hit — wait 60 seconds and try again")
+                raise HTTPException(status_code=429, detail="Polygon rate limit — wait 60s and retry")
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Polygon returned {resp.status_code}")
 
@@ -52,9 +55,7 @@ async def fetch_polygon_prices(ticker: str) -> list[dict]:
             if data.get("status") == "ERROR":
                 raise HTTPException(status_code=502, detail=data.get("error", "Polygon error"))
 
-            results = data.get("results", [])
-            for r in results:
-                # Polygon timestamps are milliseconds UTC
+            for r in data.get("results", []):
                 date_str = datetime.fromtimestamp(r["t"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
                 all_prices.append({
                     "date":   date_str,
@@ -65,11 +66,8 @@ async def fetch_polygon_prices(ticker: str) -> list[dict]:
                     "volume": int(r.get("v", 0)),
                 })
 
-            # Polygon paginates via next_url
-            url = data.get("next_url")
-            if url:
-                # next_url doesn't include apiKey
-                url = f"{url}&apiKey={POLYGON_KEY}"
+            next_url = data.get("next_url")
+            url = f"{next_url}&apiKey={POLYGON_KEY}" if next_url else None
 
     return all_prices
 
@@ -77,7 +75,6 @@ async def fetch_polygon_prices(ticker: str) -> list[dict]:
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
-    """Return cached prices if fresh (< CACHE_MAX_AGE_HOURS). None if stale/missing."""
     latest = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker)
@@ -86,11 +83,9 @@ def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
     )
     if not latest:
         return None
-
     age = datetime.now(timezone.utc) - latest.fetched_at.replace(tzinfo=timezone.utc)
     if age.total_seconds() > CACHE_MAX_AGE_HOURS * 3600:
         return None
-
     rows = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker)
@@ -98,19 +93,12 @@ def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
         .all()
     )
     return [
-        {
-            "date":  r.price_date.isoformat(),
-            "close": r.close,
-            "open":  r.open,
-            "high":  r.high,
-            "low":   r.low,
-        }
+        {"date": r.price_date.isoformat(), "close": r.close, "open": r.open, "high": r.high, "low": r.low}
         for r in rows
     ]
 
 
 def save_prices_to_cache(ticker: str, prices: list[dict], db: Session):
-    """Upsert fetched prices into stock_prices table."""
     for p in prices:
         existing = db.query(StockPrice).filter(
             StockPrice.ticker     == ticker,
@@ -137,7 +125,6 @@ def save_prices_to_cache(ticker: str, prices: list[dict], db: Session):
 
 
 def nearest_price(price_map: dict, date_str: str) -> float | None:
-    """Find close on date or nearest trading day within ±4 days."""
     if not date_str:
         return None
     if date_str in price_map:
@@ -161,7 +148,6 @@ async def refresh_prices(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Force a fresh fetch from Polygon and update the cache."""
     ticker = ticker.upper()
     prices = await fetch_polygon_prices(ticker)
     save_prices_to_cache(ticker, prices, db)
@@ -180,10 +166,7 @@ async def get_company(
 ):
     ticker = ticker.upper()
 
-    # Try cache first
     prices = get_cached_prices(ticker, db)
-
-    # Fetch from Polygon if missing or stale
     if prices is None:
         try:
             raw    = await fetch_polygon_prices(ticker)
@@ -202,7 +185,6 @@ async def get_company(
         .order_by(InsiderTrade.trade_date)
         .all()
     )
-
     my_trades = (
         db.query(MyTrade)
         .filter(MyTrade.ticker == ticker)
@@ -210,8 +192,8 @@ async def get_company(
         .all()
     )
 
-    purchases = [t for t in insider_trades if "Purchase" in (t.transaction_type or "")]
-    sales     = [t for t in insider_trades if "Sale"     in (t.transaction_type or "")]
+    purchases = [t for t in insider_trades if is_purchase(t.transaction_type)]
+    sales     = [t for t in insider_trades if is_sale(t.transaction_type)]
 
     return {
         "ticker":      ticker,
@@ -226,6 +208,7 @@ async def get_company(
                 "insider_name":     t.insider_name,
                 "insider_title":    t.insider_title,
                 "transaction_type": t.transaction_type,
+                "is_purchase":      is_purchase(t.transaction_type),
                 "price":            t.price,
                 "qty":              t.qty,
                 "value":            t.value,
