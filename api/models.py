@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    BigInteger, UniqueConstraint,
     Column, Integer, String, Float, Date, DateTime,
     ForeignKey, Text, Enum
 )
@@ -137,3 +138,22 @@ class User(Base):
     username        = Column(String(100), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class StockPrice(Base):
+    """Cached daily close prices per ticker from Alpha Vantage."""
+    __tablename__ = "stock_prices"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    ticker     = Column(String(20), nullable=False, index=True)
+    price_date = Column(Date, nullable=False)
+    open       = Column(Float, nullable=True)
+    high       = Column(Float, nullable=True)
+    low        = Column(Float, nullable=True)
+    close      = Column(Float, nullable=False)
+    volume     = Column(BigInteger, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "price_date", name="uq_stock_price"),
+    )
