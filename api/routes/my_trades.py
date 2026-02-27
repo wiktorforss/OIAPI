@@ -5,7 +5,8 @@ from typing import List, Optional
 from datetime import date
 
 from ..database import get_db
-from ..models import MyTrade, Performance, InsiderTrade
+from ..models import MyTrade, Performance, InsiderTrade, User
+from ..routes.auth import get_current_user
 from ..schemas import MyTradeCreate, MyTradeUpdate, MyTradeResponse
 
 router = APIRouter(prefix="/my-trades", tags=["My Trades"])
@@ -117,7 +118,7 @@ def update_my_trade(trade_id: int, updates: MyTradeUpdate, db: Session = Depends
 
 
 @router.delete("/{trade_id}", status_code=204)
-def delete_my_trade(trade_id: int, db: Session = Depends(get_db)):
+def delete_my_trade(trade_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Delete a personal trade record."""
     trade = db.query(MyTrade).filter(MyTrade.id == trade_id).first()
     if not trade:
