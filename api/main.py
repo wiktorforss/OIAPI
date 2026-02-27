@@ -6,7 +6,7 @@ import os
 from .database import engine
 from .models import Base
 from .routes import insider, my_trades, performance
-from .routes import auth, company
+from .routes import auth, company, portfolio
 
 
 @asynccontextmanager
@@ -15,11 +15,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(
-    title="Insider Trading Tracker API",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="Insider Trading Tracker API", version="1.0.0", lifespan=lifespan)
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
@@ -36,7 +32,7 @@ app.include_router(insider.router)
 app.include_router(my_trades.router)
 app.include_router(performance.router)
 app.include_router(company.router)
-
+app.include_router(portfolio.router)
 
 @app.get("/", tags=["Health"])
 def root():
