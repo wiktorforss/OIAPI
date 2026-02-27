@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, timezone
 import httpx
 import os
 
@@ -12,74 +12,72 @@ from ..models import User
 
 router = APIRouter(prefix="/company", tags=["Company"])
 
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
-CACHE_MAX_AGE_HOURS = 24  # Refresh prices once per day
+POLYGON_KEY       = os.getenv("POLYGON_KEY", "")
+CACHE_MAX_AGE_HOURS = 24
 
 
-# ── Alpha Vantage fetcher ─────────────────────────────────────────────────────
+# ── Polygon fetcher ───────────────────────────────────────────────────────────
 
-async def fetch_alpha_vantage(ticker: str) -> list[dict]:
+async def fetch_polygon_prices(ticker: str) -> list[dict]:
     """
-    Fetch full daily OHLCV history from Alpha Vantage (outputsize=full = 20 years).
-    Returns list of {date, open, high, low, close, volume}.
+    Fetch up to 5 years of daily OHLCV from Polygon.io.
+    Free tier: 5 req/min, unlimited daily calls.
     """
-    if not ALPHA_VANTAGE_KEY:
-        raise HTTPException(status_code=500, detail="ALPHA_VANTAGE_KEY not set in .env")
+    if not POLYGON_KEY:
+        raise HTTPException(status_code=500, detail="POLYGON_KEY not set in .env")
 
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function":   "TIME_SERIES_DAILY",
-        "symbol":     ticker,
-        "outputsize": "full",
-        "apikey":     ALPHA_VANTAGE_KEY,
-        "datatype":   "json",
-    }
+    date_from = (datetime.now(timezone.utc) - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    date_to   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    all_prices = []
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day"
+        f"/{date_from}/{date_to}"
+        f"?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_KEY}"
+    )
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url, params=params)
+        while url:
+            resp = await client.get(url)
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Alpha Vantage returned {resp.status_code}")
+            if resp.status_code == 403:
+                raise HTTPException(status_code=403, detail="Invalid Polygon API key")
+            if resp.status_code == 429:
+                raise HTTPException(status_code=429, detail="Polygon rate limit hit — wait 60 seconds and try again")
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Polygon returned {resp.status_code}")
 
-    data = resp.json()
+            data = resp.json()
 
-    if "Error Message" in data:
-        raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found on Alpha Vantage")
+            if data.get("status") == "ERROR":
+                raise HTTPException(status_code=502, detail=data.get("error", "Polygon error"))
 
-    if "Note" in data:
-        raise HTTPException(status_code=429, detail="Alpha Vantage rate limit reached (25 req/day on free tier)")
+            results = data.get("results", [])
+            for r in results:
+                # Polygon timestamps are milliseconds UTC
+                date_str = datetime.fromtimestamp(r["t"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                all_prices.append({
+                    "date":   date_str,
+                    "open":   round(r.get("o", 0), 2),
+                    "high":   round(r.get("h", 0), 2),
+                    "low":    round(r.get("l", 0), 2),
+                    "close":  round(r["c"], 2),
+                    "volume": int(r.get("v", 0)),
+                })
 
-    if "Information" in data:
-        raise HTTPException(status_code=429, detail="Alpha Vantage API limit reached")
+            # Polygon paginates via next_url
+            url = data.get("next_url")
+            if url:
+                # next_url doesn't include apiKey
+                url = f"{url}&apiKey={POLYGON_KEY}"
 
-    ts = data.get("Time Series (Daily)", {})
-    if not ts:
-        raise HTTPException(status_code=502, detail="No price data returned from Alpha Vantage")
-
-    prices = []
-    for date_str, ohlcv in sorted(ts.items()):  # sorted = oldest first
-        try:
-            prices.append({
-                "date":   date_str,
-                "open":   float(ohlcv["1. open"]),
-                "high":   float(ohlcv["2. high"]),
-                "low":    float(ohlcv["3. low"]),
-                "close":  round(float(ohlcv["4. close"]), 2),
-                "volume": int(ohlcv["5. volume"]),
-            })
-        except (KeyError, ValueError):
-            continue
-
-    return prices
+    return all_prices
 
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
-    """
-    Return cached prices if they exist and are fresh (< CACHE_MAX_AGE_HOURS old).
-    Returns None if cache is missing or stale.
-    """
+    """Return cached prices if fresh (< CACHE_MAX_AGE_HOURS). None if stale/missing."""
     latest = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker)
@@ -91,7 +89,7 @@ def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
 
     age = datetime.now(timezone.utc) - latest.fetched_at.replace(tzinfo=timezone.utc)
     if age.total_seconds() > CACHE_MAX_AGE_HOURS * 3600:
-        return None  # Stale — trigger a refresh
+        return None
 
     rows = (
         db.query(StockPrice)
@@ -100,7 +98,13 @@ def get_cached_prices(ticker: str, db: Session) -> list[dict] | None:
         .all()
     )
     return [
-        {"date": r.price_date.isoformat(), "close": r.close, "open": r.open, "high": r.high, "low": r.low}
+        {
+            "date":  r.price_date.isoformat(),
+            "close": r.close,
+            "open":  r.open,
+            "high":  r.high,
+            "low":   r.low,
+        }
         for r in rows
     ]
 
@@ -113,11 +117,11 @@ def save_prices_to_cache(ticker: str, prices: list[dict], db: Session):
             StockPrice.price_date == p["date"],
         ).first()
         if existing:
-            existing.close     = p["close"]
-            existing.open      = p.get("open")
-            existing.high      = p.get("high")
-            existing.low       = p.get("low")
-            existing.volume    = p.get("volume")
+            existing.close      = p["close"]
+            existing.open       = p.get("open")
+            existing.high       = p.get("high")
+            existing.low        = p.get("low")
+            existing.volume     = p.get("volume")
             existing.fetched_at = datetime.now(timezone.utc)
         else:
             db.add(StockPrice(
@@ -133,13 +137,13 @@ def save_prices_to_cache(ticker: str, prices: list[dict], db: Session):
 
 
 def nearest_price(price_map: dict, date_str: str) -> float | None:
-    """Find close price on date or nearest trading day within ±4 days."""
+    """Find close on date or nearest trading day within ±4 days."""
     if not date_str:
         return None
     if date_str in price_map:
         return price_map[date_str]
     try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        d = datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
         return None
     for delta in [1, -1, 2, -2, 3, -3, 4, -4]:
@@ -157,11 +161,15 @@ async def refresh_prices(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Force a fresh fetch from Alpha Vantage and update the cache."""
+    """Force a fresh fetch from Polygon and update the cache."""
     ticker = ticker.upper()
-    prices = await fetch_alpha_vantage(ticker)
+    prices = await fetch_polygon_prices(ticker)
     save_prices_to_cache(ticker, prices, db)
-    return {"ticker": ticker, "cached": len(prices), "message": f"Refreshed {len(prices)} days of price data"}
+    return {
+        "ticker":  ticker,
+        "cached":  len(prices),
+        "message": f"Refreshed {len(prices)} days of price data for {ticker}",
+    }
 
 
 @router.get("/{ticker}")
@@ -175,14 +183,13 @@ async def get_company(
     # Try cache first
     prices = get_cached_prices(ticker, db)
 
-    # If no cache or stale, fetch from Alpha Vantage
+    # Fetch from Polygon if missing or stale
     if prices is None:
         try:
-            raw = await fetch_alpha_vantage(ticker)
+            raw    = await fetch_polygon_prices(ticker)
             save_prices_to_cache(ticker, raw, db)
-            prices = [{"date": p["date"], "close": p["close"], "open": p.get("open"), "high": p.get("high"), "low": p.get("low")} for p in raw]
-        except HTTPException as e:
-            # Return with empty prices but don't crash — still show trade data
+            prices = raw
+        except HTTPException:
             prices = []
         except Exception:
             prices = []
@@ -207,9 +214,9 @@ async def get_company(
     sales     = [t for t in insider_trades if "Sale"     in (t.transaction_type or "")]
 
     return {
-        "ticker":    ticker,
-        "yahoo_url": f"https://finance.yahoo.com/quote/{ticker}",
-        "prices":    prices,
+        "ticker":      ticker,
+        "yahoo_url":   f"https://finance.yahoo.com/quote/{ticker}",
+        "prices":      prices,
         "price_count": len(prices),
         "insider_trades": [
             {
