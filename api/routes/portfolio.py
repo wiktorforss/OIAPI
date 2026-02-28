@@ -31,25 +31,29 @@ def get_portfolio(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Compute current holdings from all logged buy/sell trades.
+    Compute current holdings from the logged-in user's buy/sell trades.
     Returns one row per ticker showing net position, avg cost, current value and P&L.
     """
-    trades = db.query(MyTrade).order_by(MyTrade.trade_date).all()
+    trades = (
+        db.query(MyTrade)
+        .filter(MyTrade.user_id == current_user.id)
+        .order_by(MyTrade.trade_date)
+        .all()
+    )
 
-    # Aggregate per ticker using FIFO-style average cost tracking
     holdings: dict[str, dict] = defaultdict(lambda: {
-        "shares":         0.0,
-        "cost_basis":     0.0,  # total money spent (for avg cost calc)
-        "realized_pnl":   0.0,  # profit/loss from completed sells
-        "trade_count":    0,
-        "first_buy_date": None,
+        "shares":          0.0,
+        "cost_basis":      0.0,
+        "realized_pnl":    0.0,
+        "trade_count":     0,
+        "first_buy_date":  None,
         "last_trade_date": None,
     })
 
     for t in trades:
         h = holdings[t.ticker]
-        h["trade_count"]    += 1
-        h["last_trade_date"] = t.trade_date.isoformat() if t.trade_date else None
+        h["trade_count"]     += 1
+        h["last_trade_date"]  = t.trade_date.isoformat() if t.trade_date else None
 
         if t.trade_type == "buy":
             h["shares"]     += t.shares
@@ -59,78 +63,44 @@ def get_portfolio(
 
         elif t.trade_type == "sell":
             if h["shares"] > 0:
-                # Realize P&L: sell at t.price vs avg cost
-                avg_cost = h["cost_basis"] / h["shares"] if h["shares"] > 0 else 0
+                avg_cost    = h["cost_basis"] / h["shares"]
                 sold_shares = min(t.shares, h["shares"])
                 h["realized_pnl"] += sold_shares * (t.price - avg_cost)
-                # Reduce cost basis proportionally
-                h["cost_basis"] -= sold_shares * avg_cost
-                h["shares"]     -= sold_shares
-                h["shares"]      = max(h["shares"], 0)
-                h["cost_basis"]  = max(h["cost_basis"], 0)
+                h["cost_basis"]   -= sold_shares * avg_cost
+                h["shares"]       -= sold_shares
+                h["shares"]        = max(h["shares"], 0)
+                h["cost_basis"]    = max(h["cost_basis"], 0)
 
-    # Build positions — only include tickers where we still hold shares
-    positions = []
-    total_portfolio_value    = 0.0
-    total_portfolio_cost     = 0.0
-    total_realized_pnl       = 0.0
-
+    result = []
     for ticker, h in holdings.items():
-        # Include closed positions (0 shares) for realized P&L visibility
+        if h["shares"] <= 0 and h["trade_count"] == 0:
+            continue
+
         current_price, price_date = _latest_price(ticker, db)
+        avg_cost = h["cost_basis"] / h["shares"] if h["shares"] > 0 else 0
+        market_value = (current_price * h["shares"]) if current_price and h["shares"] > 0 else None
+        unrealized_pnl = (market_value - h["cost_basis"]) if market_value is not None else None
+        unrealized_pct = (
+            round((unrealized_pnl / h["cost_basis"]) * 100, 2)
+            if unrealized_pnl is not None and h["cost_basis"] > 0
+            else None
+        )
 
-        shares       = round(h["shares"], 6)
-        cost_basis   = round(h["cost_basis"], 2)
-        avg_cost     = round(cost_basis / shares, 4) if shares > 0 else 0
-
-        current_value    = round(shares * current_price, 2) if current_price and shares > 0 else None
-        unrealized_pnl   = round(current_value - cost_basis, 2) if current_value is not None else None
-        unrealized_pct   = round((unrealized_pnl / cost_basis) * 100, 2) if unrealized_pnl is not None and cost_basis > 0 else None
-        total_pnl        = round((unrealized_pnl or 0) + h["realized_pnl"], 2)
-
-        if shares > 0:
-            total_portfolio_value += current_value or 0
-            total_portfolio_cost  += cost_basis
-
-        total_realized_pnl += h["realized_pnl"]
-
-        positions.append({
-            "ticker":           ticker,
-            "shares":           shares,
-            "avg_cost":         avg_cost,
-            "cost_basis":       cost_basis,
-            "current_price":    current_price,
-            "price_date":       price_date,
-            "current_value":    current_value,
-            "unrealized_pnl":   unrealized_pnl,
-            "unrealized_pct":   unrealized_pct,
-            "realized_pnl":     round(h["realized_pnl"], 2),
-            "total_pnl":        total_pnl,
-            "trade_count":      h["trade_count"],
-            "first_buy_date":   h["first_buy_date"],
-            "last_trade_date":  h["last_trade_date"],
-            "is_open":          shares > 0,
+        result.append({
+            "ticker":          ticker,
+            "shares":          round(h["shares"], 6),
+            "avg_cost":        round(avg_cost, 4),
+            "cost_basis":      round(h["cost_basis"], 2),
+            "current_price":   current_price,
+            "price_date":      price_date,
+            "market_value":    round(market_value, 2) if market_value is not None else None,
+            "unrealized_pnl":  round(unrealized_pnl, 2) if unrealized_pnl is not None else None,
+            "unrealized_pct":  unrealized_pct,
+            "realized_pnl":    round(h["realized_pnl"], 2),
+            "trade_count":     h["trade_count"],
+            "first_buy_date":  h["first_buy_date"],
+            "last_trade_date": h["last_trade_date"],
         })
 
-    # Sort: open positions first by value desc, then closed by realized P&L
-    positions.sort(key=lambda p: (
-        0 if p["is_open"] else 1,
-        -(p["current_value"] or 0) if p["is_open"] else -p["realized_pnl"]
-    ))
-
-    total_unrealized = round(total_portfolio_value - total_portfolio_cost, 2)
-    total_unrealized_pct = round((total_unrealized / total_portfolio_cost) * 100, 2) if total_portfolio_cost > 0 else 0
-
-    return {
-        "positions": positions,
-        "summary": {
-            "total_portfolio_value":   round(total_portfolio_value, 2),
-            "total_cost_basis":        round(total_portfolio_cost, 2),
-            "total_unrealized_pnl":    total_unrealized,
-            "total_unrealized_pct":    total_unrealized_pct,
-            "total_realized_pnl":      round(total_realized_pnl, 2),
-            "total_pnl":               round(total_unrealized + total_realized_pnl, 2),
-            "open_positions":          sum(1 for p in positions if p["is_open"]),
-            "closed_positions":        sum(1 for p in positions if not p["is_open"]),
-        }
-    }
+    result.sort(key=lambda x: (x["market_value"] or 0), reverse=True)
+    return result

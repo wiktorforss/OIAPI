@@ -30,10 +30,11 @@ def get_my_trades(
     date_to: Optional[date] = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Get your personal trade log with optional filters."""
-    q = db.query(MyTrade)
+    q = db.query(MyTrade).filter(MyTrade.user_id == current_user.id)
     if ticker:
         q = q.filter(MyTrade.ticker == ticker.upper())
     if trade_type:
@@ -46,9 +47,12 @@ def get_my_trades(
 
 
 @router.post("/", response_model=MyTradeResponse, status_code=201)
-def create_my_trade(trade: MyTradeCreate, db: Session = Depends(get_db)):
+def create_my_trade(
+    trade: MyTradeCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Log a new personal trade."""
-    # Optionally validate related insider trade exists
     if trade.related_insider_trade_id:
         insider = db.query(InsiderTrade).filter(
             InsiderTrade.id == trade.related_insider_trade_id
@@ -60,6 +64,7 @@ def create_my_trade(trade: MyTradeCreate, db: Session = Depends(get_db)):
             )
 
     db_trade = MyTrade(
+        user_id=current_user.id,
         ticker=trade.ticker.upper(),
         trade_type=trade.trade_type,
         trade_date=trade.trade_date,
@@ -70,9 +75,8 @@ def create_my_trade(trade: MyTradeCreate, db: Session = Depends(get_db)):
         related_insider_trade_id=trade.related_insider_trade_id,
     )
     db.add(db_trade)
-    db.flush()  # get the ID before creating performance record
+    db.flush()
 
-    # Auto-create a performance record seeded with entry price
     perf = Performance(
         my_trade_id=db_trade.id,
         ticker=db_trade.ticker,
@@ -85,18 +89,33 @@ def create_my_trade(trade: MyTradeCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{trade_id}", response_model=MyTradeResponse)
-def get_my_trade(trade_id: int, db: Session = Depends(get_db)):
+def get_my_trade(
+    trade_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Get a single personal trade by ID."""
-    trade = db.query(MyTrade).filter(MyTrade.id == trade_id).first()
+    trade = db.query(MyTrade).filter(
+        MyTrade.id == trade_id,
+        MyTrade.user_id == current_user.id,
+    ).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     return trade
 
 
 @router.patch("/{trade_id}", response_model=MyTradeResponse)
-def update_my_trade(trade_id: int, updates: MyTradeUpdate, db: Session = Depends(get_db)):
+def update_my_trade(
+    trade_id: int,
+    updates: MyTradeUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Update notes or correct a trade entry."""
-    trade = db.query(MyTrade).filter(MyTrade.id == trade_id).first()
+    trade = db.query(MyTrade).filter(
+        MyTrade.id == trade_id,
+        MyTrade.user_id == current_user.id,
+    ).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
@@ -108,7 +127,6 @@ def update_my_trade(trade_id: int, updates: MyTradeUpdate, db: Session = Depends
     if updates.price is not None:
         trade.price = updates.price
         trade.total_value = _compute_total(trade.shares, updates.price)
-        # Update performance entry price too
         if trade.performance:
             trade.performance.price_at_trade = updates.price
 
@@ -118,9 +136,16 @@ def update_my_trade(trade_id: int, updates: MyTradeUpdate, db: Session = Depends
 
 
 @router.delete("/{trade_id}", status_code=204)
-def delete_my_trade(trade_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def delete_my_trade(
+    trade_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Delete a personal trade record."""
-    trade = db.query(MyTrade).filter(MyTrade.id == trade_id).first()
+    trade = db.query(MyTrade).filter(
+        MyTrade.id == trade_id,
+        MyTrade.user_id == current_user.id,
+    ).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
     db.delete(trade)

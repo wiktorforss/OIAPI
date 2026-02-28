@@ -48,7 +48,7 @@ class InsiderTrade(Base):
     # Insider info
     insider_name = Column(String(255))
     insider_title = Column(String(255))
-    is_director = Column(String(1))   # 1 or blank
+    is_director = Column(String(1))
     is_officer = Column(String(1))
     is_ten_pct_owner = Column(String(1))
     is_other = Column(String(1))
@@ -56,10 +56,10 @@ class InsiderTrade(Base):
     # Transaction details
     transaction_type = Column(String(50), index=True)
     price = Column(Float)
-    qty = Column(Float)           # shares traded
-    owned = Column(Float)         # shares owned after trade
-    delta_own = Column(String(20)) # % change in ownership
-    value = Column(Float, index=True)  # USD value of trade
+    qty = Column(Float)
+    owned = Column(Float)
+    delta_own = Column(String(20))
+    value = Column(Float, index=True)
 
     scraped_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -69,12 +69,16 @@ class InsiderTrade(Base):
 
 class MyTrade(Base):
     """
-    Your personal buy/sell log.
+    Personal buy/sell log — scoped to the owning user.
     """
     __tablename__ = "my_trades"
 
     id = Column(Integer, primary_key=True, index=True)
 
+    # ── Owner ──────────────────────────────────────────────────────────────────
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # ── Trade details ──────────────────────────────────────────────────────────
     ticker = Column(String(10), index=True, nullable=False)
     trade_type = Column(String(10), nullable=False)  # 'buy' or 'sell'
     trade_date = Column(Date, nullable=False, index=True)
@@ -91,6 +95,7 @@ class MyTrade(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships
+    owner = relationship("User", back_populates="trades")
     related_insider_trade = relationship("InsiderTrade", back_populates="my_trades")
     performance = relationship("Performance", back_populates="my_trade", uselist=False)
 
@@ -98,7 +103,6 @@ class MyTrade(Base):
 class Performance(Base):
     """
     Tracks how a stock performed after your trade.
-    Price snapshots are updated by a scheduled job (or manually).
     """
     __tablename__ = "performance"
 
@@ -106,9 +110,8 @@ class Performance(Base):
     my_trade_id = Column(Integer, ForeignKey("my_trades.id"), unique=True, nullable=False)
 
     ticker = Column(String(10), index=True)
-    price_at_trade = Column(Float)   # price when you made your trade
+    price_at_trade = Column(Float)
 
-    # Price snapshots
     price_1w = Column(Float, nullable=True)
     price_2w = Column(Float, nullable=True)
     price_1m = Column(Float, nullable=True)
@@ -116,7 +119,6 @@ class Performance(Base):
     price_6m = Column(Float, nullable=True)
     price_1y = Column(Float, nullable=True)
 
-    # Computed returns (%) — populated alongside price snapshots
     return_1w = Column(Float, nullable=True)
     return_2w = Column(Float, nullable=True)
     return_1m = Column(Float, nullable=True)
@@ -126,7 +128,6 @@ class Performance(Base):
 
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    # Relationships
     my_trade = relationship("MyTrade", back_populates="performance")
 
 
@@ -138,6 +139,9 @@ class User(Base):
     username        = Column(String(100), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    trades = relationship("MyTrade", back_populates="owner")
 
 
 class StockPrice(Base):
