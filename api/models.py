@@ -157,3 +157,32 @@ class StockPrice(Base):
     __table_args__ = (
         UniqueConstraint("ticker", "price_date", name="uq_stock_price"),
     )
+
+
+class Watchlist(Base):
+    """A named collection of tickers to watch."""
+    __tablename__ = "watchlists"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    name       = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    items = relationship("WatchlistItem", back_populates="watchlist", cascade="all, delete-orphan")
+
+
+class WatchlistItem(Base):
+    """A single ticker within a watchlist."""
+    __tablename__ = "watchlist_items"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    watchlist_id = Column(Integer, ForeignKey("watchlists.id"), nullable=False)
+    ticker       = Column(String(20), nullable=False)
+    notes        = Column(Text, nullable=True)
+    added_at     = Column(DateTime(timezone=True), server_default=func.now())
+
+    watchlist = relationship("Watchlist", back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("watchlist_id", "ticker", name="uq_watchlist_ticker"),
+    )
