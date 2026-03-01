@@ -6,7 +6,7 @@ import os
 from .database import engine
 from .models import Base
 from .routes import insider, my_trades, performance
-from .routes import auth, company, portfolio, watchlist
+from .routes import auth, company, portfolio, watchlist, signals
 
 
 @asynccontextmanager
@@ -34,6 +34,7 @@ app.include_router(performance.router)
 app.include_router(company.router)
 app.include_router(portfolio.router)
 app.include_router(watchlist.router)
+app.include_router(signals.router)
 
 @app.get("/", tags=["Health"])
 def root():
